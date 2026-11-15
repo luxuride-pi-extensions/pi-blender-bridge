@@ -35,10 +35,10 @@ MIN_WALL_METRES = {
 # one-sided prop back is a style choice; the same face on a print is a hole.
 CRITICAL = {
     "prop": {"empty", "bounds"},
-    "character": {"empty", "unappliedScale", "bounds", "nonManifold", "wallThickness", "duplicateObjects"},
-    "hard_surface": {"empty", "unappliedScale", "bounds", "selfIntersections", "duplicateObjects"},
+    "character": {"empty", "blockout", "unappliedScale", "bounds", "nonManifold", "wallThickness", "duplicateObjects"},
+    "hard_surface": {"empty", "blockout", "unappliedScale", "bounds", "selfIntersections", "duplicateObjects"},
     "interior": {"empty", "bounds"},
-    "print": {"empty", "unappliedScale", "bounds", "nonManifold", "selfIntersections", "wallThickness", "duplicateObjects"},
+    "print": {"empty", "blockout", "unappliedScale", "bounds", "nonManifold", "selfIntersections", "wallThickness", "duplicateObjects"},
     # A paint job is judged on the material it applied: a mesh with no material,
     # or one still on Blender's default surface, has nothing for a critic to see.
     "paint": {"uv", "missingMaterial", "defaultMaterial"},
@@ -113,6 +113,26 @@ def _duplicate_objects(bpy, candidates, owned_objects, objects):
             continue
         copies_by_base.setdefault(match.group("base"), []).append(name)
     return [{"base": base, "copies": sorted(names)} for base, names in sorted(copies_by_base.items())]
+
+BLOCKOUT_TAG = "pi_blender_blockout"
+
+
+def _blockouts(bpy, objects):
+    """Objects still carrying a generative blockout tag.
+
+    A blockout is a starting point, not a module output. The provider answers in
+    its own topology -- dense, usually non-manifold, often with no UVs -- and the
+    tag is what lets this verdict tell it apart from geometry a worker actually
+    built. The check reads the tag rather than the geometry, because a blockout
+    that happens to be manifold is still unbuilt: nothing has decided what its
+    front, its shell or its material split should be.
+    """
+    found = []
+    for name in objects or ():
+        obj = bpy.data.objects.get(name)
+        if obj is not None and obj.get(BLOCKOUT_TAG):
+            found.append(obj.name)
+    return sorted(found)
 
 
 def _mesh_objects(bpy, objects):
@@ -586,6 +606,23 @@ def validate(bpy, objects, profile="prop", symmetry_axis="x", added_objects=None
                 warnings.append(check_id)
         elif result["status"] in {"warn", "skipped"}:
             warnings.append(check_id)
+
+    blockouts = _blockouts(bpy, objects)
+    blockout_critical = "blockout" in critical
+    record(
+        "blockout",
+        _check(
+            "block" if blockouts and blockout_critical else "warn" if blockouts else "ok",
+            {"objects": blockouts} if blockouts else None,
+            method='obj["pi_blender_blockout"] on the datablocks owned by the module',
+            reason=(
+                "a generative blockout is a starting point; rebuild or retopologise it before the module ships it"
+                if blockouts
+                else None
+            ),
+        ),
+        blockout_critical,
+    )
 
     bounds = _bounds(bpy, meshes, depsgraph)
     flat = bool(meshes) and any(value <= 1e-6 for value in bounds["dimensions"])

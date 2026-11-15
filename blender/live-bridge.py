@@ -4567,6 +4567,8 @@ def handle_request(request):
         return export_asset.handle_export(request, ensure_requested_blend_open)
     if request_type == "import":
         return import_asset.handle_import(request, ensure_requested_blend_open)
+    if request_type == "blockout-import":
+        return import_asset.handle_blockout_import(request, ensure_requested_blend_open)
     if request_type == "open-blend":
         return handle_open_blend(request)
     if request_type == "reload-blend":
