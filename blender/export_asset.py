@@ -205,6 +205,48 @@ def _check(name, status, detail):
     return {"name": name, "status": status, "detail": detail}
 
 
+def _samples_any_image(material):
+    """Whether any node in the material loads an image, in any chain.
+
+    Deliberately wider than `_verify_textures`, which follows only the sockets
+    the exporter writes: that is the right question for "must this image be in
+    the file" and the wrong one for "did this material ever claim a texture".
+    """
+    nodes = getattr(material, "node_tree", None)
+    if nodes is None:
+        return False
+    return any(node.type == "TEX_IMAGE" and node.image is not None for node in nodes.nodes)
+
+
+def _texture_note(fmt, texture_report, materials):
+    """Why a glTF export with zero textures must not read as a pass.
+
+    `_verify_textures` raises for the broken case: a material samples an image in
+    a socket the exporter writes, and the file lost it. The quiet case is the
+    other one. The exporter only walks the glTF texture slots, so a map behind a
+    Bump, a colour ramp or another procedural chain is dropped while the file
+    stays valid -- the asset arrives flat, and `0 texture(s)` reported as a pass
+    says "no textures were needed" when the truth is "the ones that exist were
+    not carried". Zero textures on plainly untextured geometry is reported too,
+    for the simpler reason that a reader has to know the file is geometry only.
+
+    Returns None when there is nothing to report: a non-glTF format carries no
+    textures by design, and a file with textures speaks for itself.
+    """
+    if fmt not in {"glb", "gltf"}:
+        return None
+    if (texture_report or {}).get("textures"):
+        return None
+    claimed = sorted({material.name for material in materials if _samples_any_image(material)})
+    if claimed:
+        return (
+            "the exported glTF carries 0 textures although these materials sample images: {}. The maps "
+            "sit behind nodes the exporter does not walk, so the asset arrives flat. Bake them into the "
+            "glTF texture slots, or export the images separately."
+        ).format(", ".join(claimed))
+    return "the exported glTF carries 0 textures; the asset is geometry only"
+
+
 def _mesh_objects(objects):
     return [obj for obj in objects if obj.type == "MESH"]
 
@@ -286,17 +328,19 @@ def _print_checks(objects, scene):
     return checks
 
 
-def _gltf_checks(document, fmt, export_path, objects):
+def _gltf_checks(document, fmt, export_path, objects, note=None):
     checks = []
     meshes = document.get("meshes") or []
     nodes = document.get("nodes") or []
     materials = document.get("materials") or []
     images = document.get("images") or []
+    textures = document.get("textures") or []
     accessors = document.get("accessors") or []
     checks.append(_check("nodes", "fail" if not nodes else "pass", f"{len(nodes)} node(s)"))
     checks.append(_check("meshes", "fail" if not meshes else "pass", f"{len(meshes)} mesh(es)"))
     checks.append(_check("materials", "pass", f"{len(materials)} material(s)"))
     checks.append(_check("images", "pass", f"{len(images)} image(s)"))
+    checks.append(_check("textures", "warn", note) if note is not None else _check("textures", "pass", f"{len(textures)} texture(s)"))
     if fmt == "gltf":
         for image in images:
             uri = image.get("uri")
@@ -316,7 +360,7 @@ def _gltf_checks(document, fmt, export_path, objects):
     return checks
 
 
-def _engine_checks(objects, materials):
+def _engine_checks(objects, materials, note=None):
     checks = []
     textures = 0
     largest = 0
@@ -331,8 +375,11 @@ def _engine_checks(objects, materials):
             # forces the load so an 8K map is not reported as 0 px.
             node.image.pixels[0]
             largest = max(largest, int(node.image.size[0]), int(node.image.size[1]))
-    checks.append(_check("textures", "warn" if largest > 4096 else "pass",
-        f"{textures} texture node(s); largest {largest}px"))
+    if note is not None:
+        checks.append(_check("textures", "warn", note))
+    else:
+        checks.append(_check("textures", "warn" if largest > 4096 else "pass",
+            f"{textures} texture node(s); largest {largest}px"))
     checks.append(_check("materials", "warn" if len(materials) > 16 else "pass",
         f"{len(materials)} material(s)"))
     checks.append(_check("objects", "fail" if not _mesh_objects(objects) else "pass",
@@ -340,7 +387,7 @@ def _engine_checks(objects, materials):
     return checks
 
 
-def _validate_export(profile, fmt, export_path, objects, materials):
+def _validate_export(profile, fmt, export_path, objects, materials, texture_report=None):
     if profile == "none":
         return None
     if profile not in {"gltf", "print", "engine"}:
@@ -349,12 +396,13 @@ def _validate_export(profile, fmt, export_path, objects, materials):
         # A caller that leaves the default on an STL has not asked for glTF
         # checks; the format has no glTF to inspect.
         return None
+    note = _texture_note(fmt, texture_report, materials)
     if profile == "print":
         checks = _print_checks(objects, bpy.context.scene)
     elif profile == "engine":
-        checks = _engine_checks(objects, materials)
+        checks = _engine_checks(objects, materials, note)
     else:
-        checks = _gltf_checks(_read_gltf_json(export_path), fmt, export_path, objects)
+        checks = _gltf_checks(_read_gltf_json(export_path), fmt, export_path, objects, note)
     return {
         "profile": profile,
         "ok": all(check["status"] != "fail" for check in checks),
@@ -454,7 +502,7 @@ def handle_export(request, open_blend):
     ]
     default_profile = "print" if fmt in {"obj", "stl"} else "gltf"
     profile = str(request.get("validationProfile") or default_profile).lower()
-    validation = _validate_export(profile, fmt, export_path, exported_objects, exported_materials)
+    validation = _validate_export(profile, fmt, export_path, exported_objects, exported_materials, texture_report)
     warnings = []
     if validation is not None and not validation["ok"]:
         failed = [check["name"] for check in validation["checks"] if check["status"] == "fail"]
@@ -465,6 +513,9 @@ def handle_export(request, open_blend):
             "will arrive with only their Principled defaults: {}. Bake them to "
             "images before exporting.".format(", ".join(procedural_materials))
         )
+    texture_note = _texture_note(fmt, texture_report, exported_materials)
+    if texture_note:
+        warnings.append(texture_note)
 
     return {
         "format": fmt,
