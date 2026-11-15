@@ -41,6 +41,16 @@ from readonly_guard import ReadOnlyViolation, read_only_run  # pyright: ignore[r
 # pi-lens-ignore: ast-grep:unresolved-import-python
 import montage  # pyright: ignore[reportMissingImports]
 
+# The sheet composer and its difference metrics, so a comparison panel means the
+# same thing here as it does in a stored review packet.
+# pi-lens-ignore: ast-grep:unresolved-import-python
+from render_scene import (  # pyright: ignore[reportMissingImports]
+    COMPARISON_SIZE_WARNING,
+    difference_heatmap,
+    difference_metrics,
+    flatten_alpha,
+)
+
 # The interchange exporters. Separate for the same reason as montage: the format
 # table and the sanitising are separable from request plumbing.
 # pi-lens-ignore: ast-grep:unresolved-import-python
@@ -4235,6 +4245,62 @@ def _montage_sheet(panels, labels, columns, panel_width):
     return montage.tile(panels, labels, columns=columns, label_scale=max(2, min(4, panel_width // (12 * columns))))
 
 
+def _comparison_difference(baseline_panels, current_panels, view_names):
+    """Measure and draw the BEFORE/AFTER difference for every view.
+
+    Returns `(diff, panels, labels)`. `diff` has the shape a stored packet
+    reports, so `blender_compare` prints one number whichever path composed the
+    sheet. The heatmaps are their own row under the before/after grid rather
+    than a third column: the reading order of the two generations is what makes
+    a comparison readable, and inserting a panel between them would break the
+    pairing every row depends on.
+
+    A panel that came back at a different shape than its counterpart cannot be
+    differenced, so the numbers are withheld and the warning says why. The
+    metrics aggregate by taking the mean across views: every panel of one sheet
+    is rendered at the same resolution, so the pixel counts do not weight it.
+    """
+    if not baseline_panels or len(baseline_panels) != len(current_panels):
+        return None, [], []
+    pairs = list(zip(baseline_panels, current_panels, strict=True))
+    if any(before.shape != after.shape for before, after in pairs):
+        return {
+            "meanAbsDiff": None,
+            "maxAbsDiff": None,
+            "structuralScore": None,
+            "changedPixelRatio": None,
+            "widthMatch": False,
+            "warnings": [COMPARISON_SIZE_WARNING],
+        }, [], []
+    metrics = [
+        difference_metrics(flatten_alpha(after), flatten_alpha(before))
+        for before, after in pairs
+    ]
+    panels = []
+    labels = []
+    for view_name, baseline_panel, current_panel, view in zip(
+        view_names, baseline_panels, current_panels, metrics, strict=True
+    ):
+        # A view that did not change gets no heatmap: an all-dark tile reads as a
+        # panel that failed to render, and the number already says zero.
+        if view["meanAbsDiff"] <= 0.0:
+            continue
+        panels.append(
+            difference_heatmap(flatten_alpha(current_panel), flatten_alpha(baseline_panel))
+        )
+        labels.append(f"DIFF - MEAN {view['meanAbsDiff']:.4f} {view_name}")
+    mean_abs_diff = sum(view["meanAbsDiff"] for view in metrics) / len(metrics)
+    return {
+        "meanAbsDiff": mean_abs_diff,
+        "maxAbsDiff": max(view["maxAbsDiff"] for view in metrics),
+        "structuralScore": 1.0 - mean_abs_diff,
+        "changedPixelRatio": sum(view["changedPixelRatio"] for view in metrics)
+        / len(metrics),
+        "widthMatch": True,
+        "warnings": [],
+    }, panels, labels
+
+
 def handle_compare(request):
     """Two generations of one subject, framed identically, labelled, on one sheet.
 
@@ -4359,6 +4425,12 @@ def handle_compare(request):
         ordered_labels.append(f'{labels["current"]} {view_name}')
         ordered_paths.append(panel_paths[index])
 
+    diff, diff_panels, diff_labels = _comparison_difference(
+        baseline_panels, panels, view_names
+    )
+    ordered.extend(diff_panels)
+    ordered_labels.extend(diff_labels)
+
     columns = _as_int(request.get("columns"), "columns", 2)
     columns = max(1, min(4, columns))
     sheet, layout = _montage_sheet(ordered, ordered_labels, columns, panel_width)
@@ -4370,6 +4442,7 @@ def handle_compare(request):
         "views": [str(name) for name in view_names],
         "layout": layout,
         "labels": labels,
+        "diff": diff,
         "subject": [obj.name for obj in _resolve_probe_objects(subject)] if subject else [],
         "baseline": {
             "blendPath": os.path.abspath(baseline_blend),
@@ -4404,6 +4477,12 @@ def handle_compare(request):
                 "without them is a checkpoint from before they existed, not a "
                 "rendering fault."
                 if baseline_missing
+                else ""
+            )
+            + (
+                f" The difference heatmap was skipped: {COMPARISON_SIZE_WARNING},"
+                " so no number is reported."
+                if diff and not diff["widthMatch"]
                 else ""
             )
         ),
