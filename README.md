@@ -19,6 +19,7 @@ Keeping both halves in one repository under one identifier only made that distin
 | `blender/warm_worker.py` | The warm-pool worker that keeps a Blender process ready between runs. |
 | `blender/*.py` | The headless run scripts (`render_scene`, `scene_info`, `bake`, `export_asset`, `import_asset`, `montage`, `sculpt`, `shading`, `validation`, `fingerprint`, `module_state`, `object_detail`, `usage_guess`, …). |
 | `test/*.py` | The `--background` probes the TypeScript test suite runs against a real Blender. |
+| `blender/generate-calibration-fixtures.py` | Renders the critic calibration fixture set -- eight self-authored primitives, three clean and five defective -- that pi-blender's critic tests score. It lives here because it imports `bpy` and therefore carries this package's licence; the images it writes are committed in pi-blender as data. |
 | `blender/binder/*.py` | The FBX/OBJ transfer templates `@luxuride-pi/unity-blender` stages with a baked configuration blob (Unity <-> Blender moves have no custom-argument channel, so the settings are written into a copy of the script). |
 
 Nothing here imports the extension's TypeScript: the interface is the payload JSON on the command line, the request/response files in the bridge directory, and the files these scripts write.
@@ -61,6 +62,16 @@ blender --background --factory-startup --python test/modeling-snippets.py
 ```
 
 The TypeScript suite that drives them lives in the pi-blender repository (`npm test` there); it locates this package through the same resolution the extension uses.
+
+The calibration fixture generator is run the same way, from the pi-blender checkout, because that is where its output is committed:
+
+```bash
+cd ../pi-blender
+HOME=$HOME flatpak run --command=blender org.blender.Blender --background --factory-startup \
+    --python /abs/path/to/pi-blender-bridge/blender/generate-calibration-fixtures.py
+```
+
+It rewrites `test/fixtures/critic-calibration/manifest.json` from the labels in its `CASES` table and the hashes it measures. A Blender upgrade changes the sampler and therefore the hashes, so regenerating is a normal part of that upgrade, not a repair.
 
 ## License
 
