@@ -82,14 +82,13 @@ def _js_number(value, digits):
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def _stored_pixels(path):
-    """The saved PNG's 8-bit code values, top-down, as one int array.
+def _read_stored(path):
+    """The saved PNG's pixels exactly as Blender stores them: 0..1, bottom-up.
 
     Read back with the `Non-Color` colorspace because the sRGB default returns
     scene-linear floats: the numbers this has to agree with are measured on the
     8-bit sRGB code values a critic's viewer shows, which is also what
-    `blender/image-probe.ts` decodes out of the same file. Blender's buffer is
-    bottom-up, so it is flipped to the top-down order the probe's rows use.
+    `blender/image-probe.ts` decodes out of the same file.
     """
     # pi-lens-ignore: ast-grep:unresolved-import-python (NumPy ships with Blender)
     import numpy as np  # pyright: ignore[reportMissingImports]
@@ -104,11 +103,72 @@ def _stored_pixels(path):
         raise RuntimeError(f"could not read {path} back for measurement: {exc}") from exc
     finally:
         bpy.data.images.remove(image)
+    return flat, width, height
+
+
+def _stored_pixels(flat, height, width):
+    """The stored buffer as 8-bit code values, top-down, in the probe's row order."""
+    # pi-lens-ignore: ast-grep:unresolved-import-python (NumPy ships with Blender)
+    import numpy as np  # pyright: ignore[reportMissingImports]
+
     return np.rint(np.flipud(flat.reshape(height, width, 4)) * 255.0).astype(np.int64)
 
 
+def _ring_backdrop(flat, width, height):
+    """Measure the backdrop off the frame's outermost 1px ring.
+
+    This is the measurement the pi-blender run script used to take in its own
+    embedded Python, moved into the render process so one process reads the
+    saved pixels once. Colours are bucketed to 16 steps per channel — the same
+    quantisation the probe's palette uses — the bucket holding the most ring
+    pixels wins, and its mean is the backdrop; a ring that is mostly one colour
+    therefore reports that colour instead of an average of everything around
+    it. Ties go to the bucket first seen, walking the ring in Blender's own
+    bottom-up row order.
+
+    Returns `(colour, share)`: the colour at 0..1 per channel rounded to four
+    places, and the fraction of the ring that colour holds. `(None, None)` when
+    the image has no ring to measure.
+    """
+    if width < 1 or height < 1:
+        return None
+    # Row 0 and the last row, then the first and last column of every row in
+    # between: the ring, every pixel of it exactly once.
+    offsets = [x * 4 for x in range(width)]
+    if height > 1:
+        offsets += [((height - 1) * width + x) * 4 for x in range(width)]
+    for y in range(1, height - 1):
+        offsets.append(y * width * 4)
+        if width > 1:
+            offsets.append((y * width + width - 1) * 4)
+    counts = {}
+    totals = {}
+    for offset in offsets:
+        # `round` is Python's half-to-even, the same rule NumPy's `rint` uses,
+        # so a bucket boundary lands where the probe's rounding puts it.
+        key = (
+            int(round(float(flat[offset]) * _PALETTE_STEPS)),
+            int(round(float(flat[offset + 1]) * _PALETTE_STEPS)),
+            int(round(float(flat[offset + 2]) * _PALETTE_STEPS)),
+        )
+        counts[key] = counts.get(key, 0) + 1
+        held = totals.get(key)
+        if held is None:
+            totals[key] = [float(flat[offset]), float(flat[offset + 1]), float(flat[offset + 2])]
+        else:
+            held[0] += float(flat[offset])
+            held[1] += float(flat[offset + 1])
+            held[2] += float(flat[offset + 2])
+    mode = max(counts, key=lambda bucket: counts[bucket])
+    held = counts[mode]
+    return (
+        [_round(channel / held, 4) for channel in totals[mode]],
+        _round(held / max(1, len(offsets)), 4),
+    )
+
+
 def compute_render_stats(
-    output_path, background=(0, 0, 0), grid=(8, 8), palette_limit=6, tolerance=0.02
+    output_path, background=None, grid=(8, 8), palette_limit=6, tolerance=0.02
 ):
     """Measure the PNG this run just saved, field for field like the image probe.
 
@@ -125,12 +185,20 @@ def compute_render_stats(
     `subjectPixelCount`, `subjectCoverage`, `transparentPixels`, `meanColour`,
     `lumaGrid`, `silhouette`, `edgeSharpness`, `palette`, `exposure` and
     `warnings`.
+
+    `background=None` means "this process measures it": the saved image's own
+    border ring is read (`_ring_backdrop`), reported back as `background` and
+    `backgroundUniform`, and used as the mask's background — so an opaque render
+    over a lit world no longer reports the studio as subject. A file with any
+    transparency is split on alpha instead, and reports `background: None` with
+    `filmTransparent: True`; the same is true when the caller passes an explicit
+    `background`, which overrides the measurement exactly as it always has.
     """
     # pi-lens-ignore: ast-grep:unresolved-import-python (NumPy ships with Blender)
     import numpy as np  # pyright: ignore[reportMissingImports]
 
-    rgba = _stored_pixels(output_path)
-    height, width = rgba.shape[0], rgba.shape[1]
+    flat, width, height = _read_stored(output_path)
+    rgba = _stored_pixels(flat, height, width)
     total = width * height
     red = rgba[:, :, 0].astype(np.float64)
     green = rgba[:, :, 1].astype(np.float64)
@@ -144,7 +212,14 @@ def compute_render_stats(
 
     transparent = alpha <= _ALPHA_CUTOFF
     transparent_pixels = int(np.count_nonzero(transparent))
-    backdrop = [float(channel) * 255.0 for channel in background]
+    # Auto measurement only makes sense on an opaque frame: with any alpha the
+    # subject is whatever is opaque, and the ring is partly subject.
+    measured_background = None
+    measured_uniform = None
+    if background is None and transparent_pixels == 0:
+        measured_background, measured_uniform = _ring_backdrop(flat, width, height) or (None, None)
+    effective_background = background if background is not None else measured_background
+    backdrop = [float(channel) * 255.0 for channel in (effective_background or (0.0, 0.0, 0.0))]
     # Mean per-channel distance, the same bar the probe uses: `tolerance` reads
     # as "how far a pixel may sit from the background and still be background".
     # A negative threshold disables the comparison, which is how a film-
@@ -155,13 +230,20 @@ def compute_render_stats(
     subject_pixels = int(np.count_nonzero(mask))
 
     warnings = []
-    backdrop_text = "[" + ",".join(_js_number(channel, 6) for channel in background) + "]"
+    if effective_background is not None:
+        backdrop_text = "[" + ",".join(_js_number(channel, 6) for channel in effective_background) + "]"
     if subject_pixels == 0:
-        warnings.append(
-            f"No pixel differs from the background {backdrop_text} by more than the tolerance, "
-            "so every measurement is empty. The background colour is probably wrong for this "
-            "image — read it from the render settings rather than re-probing with another guess."
-        )
+        if effective_background is None:
+            warnings.append(
+                "No pixel could be separated from the background, so every measurement is "
+                "empty. Every pixel is transparent, so there is no subject in this image."
+            )
+        else:
+            warnings.append(
+                f"No pixel differs from the background {backdrop_text} by more than the tolerance, "
+                "so every measurement is empty. The background colour is probably wrong for this "
+                "image — read it from the render settings rather than re-probing with another guess."
+            )
     if transparent_pixels > 0:
         warnings.append(
             f"{transparent_pixels} of {total} pixels are transparent and were counted as subject. "
@@ -359,6 +441,14 @@ def compute_render_stats(
         "palette": palette,
         "exposure": exposure,
         "warnings": warnings,
+        # The backdrop the mask was actually split on, in the same 0..1 scale a
+        # caller can hand straight back to `blender_image_probe`: measured off
+        # this file's ring, taken from the argument, or None when alpha decided.
+        "background": None
+        if effective_background is None
+        else [_round(float(channel), 4) for channel in effective_background],
+        "backgroundUniform": measured_uniform,
+        "filmTransparent": transparent_pixels > 0,
     }
 
 
@@ -410,9 +500,10 @@ def render_scene(payload):
     bpy.ops.render.render(write_still=True)
 
     # Measured from the file that was just written, so a critic's numbers and a
-    # critic's picture are the same bytes. The defaults are the probe's own: a
-    # film-transparent render states its subject through alpha, and a guessed
-    # backdrop is not passed in from here.
+    # critic's picture are the same bytes. No background is passed in: this
+    # process reads the backdrop off the saved frame's own border ring (or
+    # splits on alpha when the film is transparent) and reports what it used, so
+    # a consumer never has to probe the same file again to learn it.
     stats = compute_render_stats(output_path)
 
     return {
