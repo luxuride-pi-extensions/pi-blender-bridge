@@ -11,6 +11,7 @@ Imported by generated Blender scripts, not by the extension: everything here
 needs a live `bpy`.
 """
 
+import math
 import os
 
 # pi-lens-ignore: ast-grep:unresolved-import-python (bpy is provided by Blender's Python runtime)
@@ -54,6 +55,311 @@ def set_engine(scene, desired):
         f'No usable render engine for "{desired}"; this build offers: '
         + (", ".join(sorted(available)) or "nothing enumerable")
     )
+
+
+# Perceived-luminance weights and the alpha cutoff, fixed here to the same
+# values `blender/image-probe.ts` uses: the two implementations are compared
+# field by field, so a constant that drifts on one side is a silent disagreement.
+_LUMA_R = 0.2126
+_LUMA_G = 0.7152
+_LUMA_B = 0.0722
+_ALPHA_CUTOFF = 8
+_MAX_GRID_SIDE = 32
+_MAX_PALETTE_LIMIT = 16
+_PALETTE_STEPS = 15
+_EXPOSURE_SAMPLE_CAP = 8192
+
+
+def _round(value, digits):
+    """Round half-up like JavaScript's `Math.round`, not Python's banker's."""
+    factor = 10.0**digits
+    return math.floor(value * factor + 0.5) / factor
+
+
+def _js_number(value, digits):
+    """A rounded number as JavaScript would print it, for identical warnings."""
+    text = f"{_round(value, digits):.{digits}f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _stored_pixels(path):
+    """The saved PNG's 8-bit code values, top-down, as one int array.
+
+    Read back with the `Non-Color` colorspace because the sRGB default returns
+    scene-linear floats: the numbers this has to agree with are measured on the
+    8-bit sRGB code values a critic's viewer shows, which is also what
+    `blender/image-probe.ts` decodes out of the same file. Blender's buffer is
+    bottom-up, so it is flipped to the top-down order the probe's rows use.
+    """
+    # pi-lens-ignore: ast-grep:unresolved-import-python (NumPy ships with Blender)
+    import numpy as np  # pyright: ignore[reportMissingImports]
+
+    image = bpy.data.images.load(path, check_existing=False)
+    try:
+        image.colorspace_settings.name = "Non-Color"
+        width, height = image.size
+        flat = np.empty(width * height * 4, dtype=np.float32)
+        image.pixels.foreach_get(flat)
+    except (OSError, RuntimeError, AttributeError) as exc:
+        raise RuntimeError(f"could not read {path} back for measurement: {exc}") from exc
+    finally:
+        bpy.data.images.remove(image)
+    return np.rint(np.flipud(flat.reshape(height, width, 4)) * 255.0).astype(np.int64)
+
+
+def compute_render_stats(
+    output_path, background=(0, 0, 0), grid=(8, 8), palette_limit=6, tolerance=0.02
+):
+    """Measure the PNG this run just saved, field for field like the image probe.
+
+    These numbers are computed from the SAVED PNG, inside the render process,
+    with the same rules `blender/image-probe.ts` applies: the 8-bit sRGB code
+    values of `output_path` are the whole input, so a fresh `blender_image_probe`
+    of that same file reports the same numbers. They are NOT measurements of the
+    scene-linear render buffer, and they are not expected to agree with one —
+    so do not diff these against a probe of some other file and conclude the
+    probe is broken.
+
+    The field set is the measurement half of `ImageProbeResult`, so a caller can
+    substitute this for a probe of the file it describes: `subjectBounds`,
+    `subjectPixelCount`, `subjectCoverage`, `transparentPixels`, `meanColour`,
+    `lumaGrid`, `silhouette`, `edgeSharpness`, `palette`, `exposure` and
+    `warnings`.
+    """
+    # pi-lens-ignore: ast-grep:unresolved-import-python (NumPy ships with Blender)
+    import numpy as np  # pyright: ignore[reportMissingImports]
+
+    rgba = _stored_pixels(output_path)
+    height, width = rgba.shape[0], rgba.shape[1]
+    total = width * height
+    red = rgba[:, :, 0].astype(np.float64)
+    green = rgba[:, :, 1].astype(np.float64)
+    blue = rgba[:, :, 2].astype(np.float64)
+    alpha = rgba[:, :, 3]
+
+    nx = min(_MAX_GRID_SIDE, max(1, int(round(float(grid[0])))))
+    ny = min(_MAX_GRID_SIDE, max(1, int(round(float(grid[1])))))
+    limit = min(_MAX_PALETTE_LIMIT, max(0, int(round(float(palette_limit)))))
+    tolerance = max(0.0, min(1.0, float(tolerance)))
+
+    transparent = alpha <= _ALPHA_CUTOFF
+    transparent_pixels = int(np.count_nonzero(transparent))
+    backdrop = [float(channel) * 255.0 for channel in background]
+    # Mean per-channel distance, the same bar the probe uses: `tolerance` reads
+    # as "how far a pixel may sit from the background and still be background".
+    # A negative threshold disables the comparison, which is how a film-
+    # transparent render makes alpha the only thing that decides.
+    distance = (np.abs(red - backdrop[0]) + np.abs(green - backdrop[1]) + np.abs(blue - backdrop[2])) / 3.0
+    threshold = -1.0 if transparent_pixels > 0 else tolerance * 255.0
+    mask = (~transparent) & (distance > threshold)
+    subject_pixels = int(np.count_nonzero(mask))
+
+    warnings = []
+    backdrop_text = "[" + ",".join(_js_number(channel, 6) for channel in background) + "]"
+    if subject_pixels == 0:
+        warnings.append(
+            f"No pixel differs from the background {backdrop_text} by more than the tolerance, "
+            "so every measurement is empty. The background colour is probably wrong for this "
+            "image — read it from the render settings rather than re-probing with another guess."
+        )
+    if transparent_pixels > 0:
+        warnings.append(
+            f"{transparent_pixels} of {total} pixels are transparent and were counted as subject. "
+            "On a film-transparent render the alpha channel is the subject mask and the "
+            "background colour is irrelevant."
+        )
+
+    luma = (_LUMA_R * red + _LUMA_G * green + _LUMA_B * blue) / 255.0
+
+    if subject_pixels > 0:
+        rows = np.flatnonzero(mask.any(axis=1))
+        columns = np.flatnonzero(mask.any(axis=0))
+        subject_bounds = {
+            "x0": int(columns[0]),
+            "x1": int(columns[-1]),
+            "y0": int(rows[0]),
+            "y1": int(rows[-1]),
+        }
+    else:
+        subject_bounds = None
+    divisor = subject_pixels if subject_pixels > 0 else 1
+    mean_colour = [
+        _round(float(red[mask].sum()) / divisor, 2),
+        _round(float(green[mask].sum()) / divisor, 2),
+        _round(float(blue[mask].sum()) / divisor, 2),
+    ]
+
+    # Composition grid: cell (x, y) is the mean luma of its subject pixels, or
+    # null where the cell holds none, so an empty cell is visibly empty rather
+    # than a zero that reads as black.
+    cell_x = np.minimum(nx - 1, (np.arange(width) * nx) // width)
+    cell_y = np.minimum(ny - 1, (np.arange(height) * ny) // height)
+    grid_cells = np.zeros((ny, nx), dtype=np.float64)
+    grid_counts = np.zeros((ny, nx), dtype=np.int64)
+    rows_index, columns_index = np.nonzero(mask)
+    np.add.at(grid_cells, (cell_y[rows_index], cell_x[columns_index]), luma[mask])
+    np.add.at(grid_counts, (cell_y[rows_index], cell_x[columns_index]), 1)
+    luma_grid = [
+        [
+            _round(float(grid_cells[row][column]) / int(grid_counts[row][column]), 4)
+            if grid_counts[row][column] > 0
+            else None
+            for column in range(nx)
+        ]
+        for row in range(ny)
+    ]
+
+    per_row = np.count_nonzero(mask, axis=1)
+    coverage_by_row = []
+    run_start = None
+    run_widest = 0
+    for row in range(height + 1):
+        count = int(per_row[row]) if row < height else 0
+        if count > 0:
+            if run_start is None:
+                run_start = row
+            run_widest = max(run_widest, count)
+            continue
+        if run_start is not None:
+            coverage_by_row.append({"from": run_start, "to": row - 1, "maxWidth": run_widest})
+            run_start = None
+            run_widest = 0
+    silhouette = {
+        "rowsOccupied": int(np.count_nonzero(per_row)),
+        "rowCount": height,
+        "widestRow": int(per_row.max()) if height > 0 else 0,
+        "coverageByRow": coverage_by_row,
+    }
+
+    # Edge sharpness: only the pixels that straddle the silhouette count. An
+    # interior step says nothing about the edge, and averaging those in would
+    # report a hard-edged subject as blurry because most of it is interior.
+    here = mask[:, :-1]
+    there = mask[:, 1:]
+    boundary = here != there
+    right_alpha = alpha[:, 1:]
+    boundary = boundary & (right_alpha > _ALPHA_CUTOFF)
+    crossings = int(np.count_nonzero(boundary))
+    if crossings == 0:
+        edge_sharpness = None
+    else:
+        steps = np.abs(luma[:, :-1] - luma[:, 1:])[boundary]
+        edge_sharpness = _round(float(steps.sum()) / crossings, 5)
+
+    palette = []
+    if limit > 0 and subject_pixels > 0:
+        quantised = (
+            (np.rint(red[mask] / 255.0 * _PALETTE_STEPS).astype(np.int64) << 8)
+            | (np.rint(green[mask] / 255.0 * _PALETTE_STEPS).astype(np.int64) << 4)
+            | np.rint(blue[mask] / 255.0 * _PALETTE_STEPS).astype(np.int64)
+        )
+        keys, first_seen, counts = np.unique(quantised, return_index=True, return_counts=True)
+        # Ties break on first appearance, which is what the probe's insertion-
+        # ordered Map plus a stable sort does.
+        order = np.lexsort((first_seen, -counts))[:limit]
+        step = 255.0 / _PALETTE_STEPS
+        palette = [
+            {
+                "hex": "#%02x%02x%02x"
+                % (
+                    int(round(((int(keys[index]) >> 8) & 15) * step)),
+                    int(round(((int(keys[index]) >> 4) & 15) * step)),
+                    int(round((int(keys[index]) & 15) * step)),
+                ),
+                "fraction": _round(float(counts[index]) / subject_pixels, 4),
+            }
+            for index in order
+        ]
+
+    # Exposure over the subject, on the probe's deterministic stride sample:
+    # whole-image clip fractions would count the backdrop, and a white cyclorama
+    # is 100% clipped while saying nothing about the subject.
+    stride = max(1, subject_pixels // _EXPOSURE_SAMPLE_CAP)
+    sampled_mask = np.zeros_like(mask)
+    if subject_pixels > 0 and stride == 1:
+        sampled_mask = mask
+    elif subject_pixels > 0:
+        positions = np.flatnonzero(mask)
+        sampled_mask.flat[positions[stride - 1 :: stride]] = True
+    sample_red = red[sampled_mask]
+    sample_green = green[sampled_mask]
+    sample_blue = blue[sampled_mask]
+    sampled_pixels = int(sample_red.size)
+    sampled_divisor = sampled_pixels if sampled_pixels > 0 else 1
+    sample_lumas = np.sort(luma[sampled_mask])
+
+    def percentile(fraction):
+        if sample_lumas.size == 0:
+            return 0
+        index = min(sample_lumas.size - 1, max(0, math.floor((sample_lumas.size - 1) * fraction + 0.5)))
+        return _round(float(sample_lumas[index]), 4)
+
+    def fraction(count):
+        return _round(float(count) / sampled_divisor, 5)
+
+    high_r = sample_red >= 255
+    high_g = sample_green >= 255
+    high_b = sample_blue >= 255
+    low_r = sample_red <= 0
+    low_g = sample_green <= 0
+    low_b = sample_blue <= 0
+
+    exposure = {
+        "sampled": stride > 1,
+        "sampleCount": sampled_pixels,
+        "clippedHigh": {
+            "r": fraction(np.count_nonzero(high_r)),
+            "g": fraction(np.count_nonzero(high_g)),
+            "b": fraction(np.count_nonzero(high_b)),
+            "any": fraction(np.count_nonzero(high_r | high_g | high_b)),
+            "all": fraction(np.count_nonzero(high_r & high_g & high_b)),
+        },
+        "clippedLow": {
+            "r": fraction(np.count_nonzero(low_r)),
+            "g": fraction(np.count_nonzero(low_g)),
+            "b": fraction(np.count_nonzero(low_b)),
+            "any": fraction(np.count_nonzero(low_r | low_g | low_b)),
+            "all": fraction(np.count_nonzero(low_r & low_g & low_b)),
+        },
+        "lumaPercentiles": {"p1": percentile(0.01), "p50": percentile(0.5), "p99": percentile(0.99)},
+    }
+
+    clipped_high = _round(exposure["clippedHigh"]["all"] * 100, 1)
+    clipped_low = _round(exposure["clippedLow"]["all"] * 100, 1)
+    over_clipped = _round((clipped_high + clipped_low) / 100, 4)
+    luma_range = exposure["lumaPercentiles"]["p99"] - exposure["lumaPercentiles"]["p1"]
+    # A uniformly white or black subject is flat because it is clipped, and the
+    # clipped warning below says so; calling that flat LIGHTING would tell a
+    # critic to relight a legitimately white object.
+    if sampled_pixels > 0 and luma_range < 0.05 and over_clipped <= 0.02:
+        warnings.append(
+            f"The subject's luma spans only {_js_number(luma_range, 3)} from p1 to p99. "
+            "If the subject is not a single flat material, this is a flat-light render: a "
+            "shadow, a highlight and a material change are all nearly the same value, so a "
+            "critic cannot judge shape or material until the lighting changes."
+        )
+    if sampled_pixels > 0 and over_clipped > 0.02:
+        warnings.append(
+            f"{_js_number(over_clipped * 100, 1)}% of the {sampled_pixels} sampled subject pixels "
+            f"are clipped ({_js_number(clipped_high, 1)}% white on all channels, "
+            f"{_js_number(clipped_low, 1)}% black). If the subject is not itself pure white or "
+            "black, this is an exposure or lighting problem and detail there cannot be judged "
+            "from this render."
+        )
+
+    return {
+        "subjectBounds": subject_bounds,
+        "subjectPixelCount": subject_pixels,
+        "subjectCoverage": _round(subject_pixels / total, 5),
+        "transparentPixels": transparent_pixels,
+        "meanColour": mean_colour,
+        "lumaGrid": luma_grid,
+        "silhouette": silhouette,
+        "edgeSharpness": edge_sharpness,
+        "palette": palette,
+        "exposure": exposure,
+        "warnings": warnings,
+    }
 
 
 def render_scene(payload):
@@ -103,6 +409,12 @@ def render_scene(payload):
     scene.render.filepath = output_path
     bpy.ops.render.render(write_still=True)
 
+    # Measured from the file that was just written, so a critic's numbers and a
+    # critic's picture are the same bytes. The defaults are the probe's own: a
+    # film-transparent render states its subject through alpha, and a guessed
+    # backdrop is not passed in from here.
+    stats = compute_render_stats(output_path)
+
     return {
         "outputPath": output_path,
         "cameraName": scene.camera.name if scene.camera else None,
@@ -113,6 +425,7 @@ def render_scene(payload):
             "y": int(scene.render.resolution_y),
             "percentage": int(scene.render.resolution_percentage),
         },
+        "stats": stats,
     }
 
 # A 3x5 font drawn with NumPy. Sheet labels have to survive headless Blender,
