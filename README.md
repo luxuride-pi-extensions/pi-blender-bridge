@@ -19,6 +19,7 @@ Keeping both halves in one repository under one identifier only made that distin
 | `blender/warm_worker.py` | The warm-pool worker that keeps a Blender process ready between runs. |
 | `blender/*.py` | The headless run scripts (`render_scene`, `scene_info`, `bake`, `export_asset`, `import_asset`, `montage`, `sculpt`, `shading`, `validation`, `fingerprint`, `module_state`, `object_detail`, `usage_guess`, …). |
 | `test/*.py` | The `--background` probes the TypeScript test suite runs against a real Blender. |
+| `blender/binder/*.py` | The FBX/OBJ transfer templates `@luxuride-pi/unity-blender` stages with a baked configuration blob (Unity <-> Blender moves have no custom-argument channel, so the settings are written into a copy of the script). |
 
 Nothing here imports the extension's TypeScript: the interface is the payload JSON on the command line, the request/response files in the bridge directory, and the files these scripts write.
 
@@ -27,11 +28,29 @@ Nothing here imports the extension's TypeScript: the interface is the payload JS
 `resolveBridgePackageDir()` in the extension's `config.ts` tries, in order:
 
 1. `PI_BLENDER_BRIDGE_ASSETS_DIR` — the package root (the directory containing `blender/`). For a local checkout or a non-standard install.
-2. Node resolution of `@luxuride-pi/blender-bridge/package.json` — the normal case, since the extension declares this package as a dependency.
+2. Node resolution of `@luxuride-pi/blender-bridge/package.json` — when it sits in `node_modules` (an explicit install, or a package manager that permits non-registry artifacts).
 3. A sibling checkout next to the extension (`../pi-blender-bridge`, `../blender-bridge`) — how the development symlinks under `~/.pi/agent/extensions/` resolve when the package is not in `node_modules`.
 4. `~/.pi/agent/extensions/{blender-bridge,pi-blender-bridge}`.
 
 If none of those exist it fails loudly, naming every candidate: a missing bridge is a broken install, not a degraded one, and pretending otherwise turns into "not launching Blender" much later.
+
+`@luxuride-pi/unity-blender` resolves `blender/binder/` through the same environment
+variable and the same order, so one bridge installation serves both extensions.
+
+### Why this is not an npm dependency
+
+npm 12 ships `allow-git` and `allow-remote` set to `none`, so a dependency
+written as a git spec or as a release-asset URL fails with
+
+```
+npm error Fetching packages of type "git" have been disabled
+```
+
+for every consumer. A registry dependency would work, but the package is not
+published there on purpose: it is GPL code that exists to be installed beside a
+Blender install, not a library to link. So it is a prerequisite — a clone beside
+the extension, or `PI_BLENDER_BRIDGE_ASSETS_DIR` — and the extension's error
+message names the clone command rather than pretending an install will fetch it.
 
 ## Development
 
