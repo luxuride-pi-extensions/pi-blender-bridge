@@ -114,6 +114,65 @@ with tempfile.TemporaryDirectory() as tmp:
             and default_stl["validation"]["ok"]
         )
 
+    # A glTF with zero textures is valid and flat, which is exactly the case a
+    # `pass` on `0 texture(s)` used to hide: the file is correct, the asset
+    # arrives untextured, and nothing in the report said so.
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    cube("Bare")
+    with tempfile.TemporaryDirectory() as tmp:
+        bare_path = os.path.join(tmp, "bare.glb")
+        export_asset._run_export("glb", bare_path, False, False)
+        objects = [obj for obj in bpy.data.objects if obj.type == "MESH"]
+        bare = export_asset._validate_export(
+            "gltf", "glb", bare_path, objects, [], {"images": 0, "textures": 0, "verified": None}
+        )
+        checks["untextured_glb_warns"] = bare["ok"] and any(
+            c["name"] == "textures" and c["status"] == "warn" for c in bare["checks"]
+        )
+        reported = export_asset.handle_export(
+            {"format": "glb", "outputDir": tmp, "name": "bare"}, lambda request: None
+        )
+        checks["untextured_glb_reports_a_warning"] = (
+            reported["textures"] == 0
+            and any("0 textures" in warning for warning in reported["warnings"])
+        )
+
+    # An image the exporter does not walk is an image the file cannot carry: the
+    # glTF stays valid, `_verify_textures` rightly does not demand it, and the
+    # material still claims it. Emission Strength is that case -- the exporter
+    # writes no texture for it, so the numbers arrive at their default and the
+    # asset is flat. The warning has to name the material, because "0 textures"
+    # on its own reads as "no textures were needed".
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    cube("Lit")
+    lit = bpy.data.materials.new("LitByImage")
+    lit.use_nodes = True
+    source = bpy.data.images.new("LitSource", 4, 4)
+    sampled = lit.node_tree.nodes.new("ShaderNodeTexImage")
+    sampled.image = source
+    scale = lit.node_tree.nodes.new("ShaderNodeMath")
+    scale.operation = "MULTIPLY"
+    principled = next(
+        node for node in lit.node_tree.nodes if node.type == "BSDF_PRINCIPLED"
+    )
+    lit.node_tree.links.new(sampled.outputs["Color"], scale.inputs[0])
+    lit.node_tree.links.new(scale.outputs["Value"], principled.inputs["Emission Strength"])
+    bpy.context.object.data.materials.append(lit)
+    with tempfile.TemporaryDirectory() as tmp:
+        lit_path = os.path.join(tmp, "lit.glb")
+        export_asset._run_export("glb", lit_path, False, False)
+        objects = [obj for obj in bpy.data.objects if obj.type == "MESH"]
+        materials = [slot.material for obj in objects for slot in obj.material_slots if slot.material]
+        report = export_asset._verify_textures("glb", lit_path, materials)
+        checks["a map outside the texture slots is dropped without raising"] = (
+            report["textures"] == 0 and report["verified"] is None
+        )
+        lit_result = export_asset._validate_export("gltf", "glb", lit_path, objects, materials, report)
+        checks["a dropped map warns and names the material"] = lit_result["ok"] and any(
+            c["name"] == "textures" and c["status"] == "warn" and "LitByImage" in c["detail"]
+            for c in lit_result["checks"]
+        )
+
     bad = False
     try:
         export_asset._validate_export("nonsense", "stl", "unused", [], [])

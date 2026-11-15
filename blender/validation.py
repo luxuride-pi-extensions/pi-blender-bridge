@@ -39,11 +39,29 @@ CRITICAL = {
     "hard_surface": {"empty", "unappliedScale", "bounds", "selfIntersections", "duplicateObjects"},
     "interior": {"empty", "bounds"},
     "print": {"empty", "unappliedScale", "bounds", "nonManifold", "selfIntersections", "wallThickness", "duplicateObjects"},
-    "paint": {"uv"},
+    # A paint job is judged on the material it applied: a mesh with no material,
+    # or one still on Blender's default surface, has nothing for a critic to see.
+    "paint": {"uv", "missingMaterial", "defaultMaterial"},
     "asset_pack": {"empty", "bounds"},
 }
 
 SELF_INTERSECTION_FACE_LIMIT = 60000
+
+# Blender's own Principled defaults: a Base Color of 0.8 grey, Metallic 0.0,
+# Roughness 0.5 and no texture. A material still sitting on those numbers is the
+# surface a mesh gets when nobody assigned one, and it renders as untextured
+# grey plastic -- a modelling failure to fix, not a look to judge. The tolerance
+# is per channel on 0..1, so it absorbs a value nudged in the UI without giving
+# up on "this is still the default grey".
+DEFAULT_BASE_COLOR = (0.8, 0.8, 0.8)
+DEFAULT_METALLIC = 0.0
+DEFAULT_ROUGHNESS = 0.5
+DEFAULT_TOLERANCE = 1e-3
+
+# The sockets a paint job writes to. A link into any of them is texture or
+# procedural work, which the exporter carries as a material of its own; an
+# explicit value on them is a decision somebody made, even a grey one.
+PAINTED_SOCKETS = ("Base Color", "Metallic", "Roughness", "Normal", "Emission Color")
 
 # Blender's own disambiguation suffix: `Hero` becomes `Hero.001` when a second
 # datablock claims the same name. Three digits is Blender's width; matching more
@@ -452,6 +470,90 @@ def _materials(bpy, meshes):
     return procedural
 
 
+def _surface_shader(nodes):
+    """The Principled node that actually drives the surface, or None.
+
+    Read through the Material Output link rather than by node type: a tree can
+    keep a Principled node that a Mix Shader bypasses, and taking the first one
+    of that type would call a painted surface default. A surface built from
+    anything else is not a default material by this definition.
+    """
+    for node in nodes.nodes:
+        if node.type != "OUTPUT_MATERIAL":
+            continue
+        socket = node.inputs.get("Surface")
+        if socket is None or not socket.is_linked:
+            return None
+        source = socket.links[0].from_node
+        return source if source.type == "BSDF_PRINCIPLED" else None
+    return None
+
+
+def _matches(component, expected, tolerance=DEFAULT_TOLERANCE):
+    return abs(float(component) - expected) <= tolerance
+
+
+def _is_default_material(material):
+    """True when the material is still Blender's untouched Principled surface.
+
+    Any custom Base Color, non-default Metallic or Roughness, or a link into one
+    of PAINTED_SOCKETS means somebody painted it, so a hand-picked grey of 0.4
+    reports as painted while the untouched 0.8 does not. The tolerance is per
+    channel on the same 0..1 scale the socket holds.
+    """
+    nodes = getattr(material, "node_tree", None)
+    if nodes is None:
+        return False
+    surface = _surface_shader(nodes)
+    if surface is None:
+        return False
+    for name in PAINTED_SOCKETS:
+        socket = surface.inputs.get(name)
+        if socket is not None and socket.is_linked:
+            return False
+    base = surface.inputs.get("Base Color")
+    if base is None or len(base.default_value) < 3:
+        return False
+    if not all(_matches(base.default_value[index], DEFAULT_BASE_COLOR[index]) for index in range(3)):
+        return False
+    metallic = surface.inputs.get("Metallic")
+    if metallic is not None and not _matches(metallic.default_value, DEFAULT_METALLIC):
+        return False
+    roughness = surface.inputs.get("Roughness")
+    if roughness is not None and not _matches(roughness.default_value, DEFAULT_ROUGHNESS):
+        return False
+    return True
+
+
+def _material_presence(meshes):
+    """Meshes with no material at all, and materials left on the default surface.
+
+    Both are decided from the material data rather than from the render: a
+    picture cannot separate a default grey from a grey somebody chose, and by
+    the time a critic has looked at one the answer has already cost a look.
+    A mesh with no slot, or whose every slot is empty, is reported once and its
+    material is not also called default; the remaining materials are
+    deduplicated by name, because a default shared by five meshes is one
+    mistake, not five.
+    """
+    missing = []
+    default = []
+    seen = set()
+    for obj in meshes:
+        slots = list(getattr(obj, "material_slots", []) or [])
+        if not slots or all(slot.material is None for slot in slots):
+            missing.append(obj.name)
+            continue
+        for slot in slots:
+            material = slot.material
+            if material is None or material.name in seen:
+                continue
+            seen.add(material.name)
+            if _is_default_material(material):
+                default.append(material.name)
+    return {"missing": missing, "default": default}
+
+
 def validate(bpy, objects, profile="prop", symmetry_axis="x", added_objects=None, owned_objects=None):
     """Return the preflight verdict for the objects a module wrote.
 
@@ -544,6 +646,42 @@ def validate(bpy, objects, profile="prop", symmetry_axis="x", added_objects=None
 
     procedural = _materials(bpy, meshes)
     record("materials", _check("warn" if procedural else "ok", {"procedural": procedural} if procedural else {"procedural": []}, "node types outside the glTF-safe set"), "materials" in critical)
+
+    # Reported after `materials` because the two answer different questions:
+    # that one asks whether the paint will survive export, these ask whether
+    # there is any paint to export at all. Both are warnings everywhere except
+    # paint, where a surface nobody authored is disqualifying rather than worth
+    # a look.
+    presence = _material_presence(meshes)
+    record(
+        "missingMaterial",
+        _check(
+            "block" if presence["missing"] and "missingMaterial" in critical else "warn" if presence["missing"] else "ok",
+            {"objects": presence["missing"]},
+            "material_slots on the named meshes; no slot, or every slot empty, counts as missing",
+            reason=(
+                "an unassigned mesh renders as the default surface, so nothing about its material was authored"
+                if presence["missing"]
+                else None
+            ),
+        ),
+        "missingMaterial" in critical,
+    )
+    record(
+        "defaultMaterial",
+        _check(
+            "block" if presence["default"] and "defaultMaterial" in critical else "warn" if presence["default"] else "ok",
+            {"materials": presence["default"]},
+            "the Principled surface linked to Material Output, with no links into " + ", ".join(PAINTED_SOCKETS),
+            limit={"baseColor": list(DEFAULT_BASE_COLOR), "metallic": DEFAULT_METALLIC, "roughness": DEFAULT_ROUGHNESS, "tolerance": DEFAULT_TOLERANCE},
+            reason=(
+                "the material still has Blender's default Base Color, Metallic and Roughness, so it renders as an unpainted surface"
+                if presence["default"]
+                else None
+            ),
+        ),
+        "defaultMaterial" in critical,
+    )
 
     return {
         "profile": profile,
