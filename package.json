@@ -1,28 +1,30 @@
 {
-  "name": "@luxuride-pi/blender-bridge",
-  "version": "0.1.0",
-  "description": "The GPL-3.0 Python half of pi-blender: the live bridge, the headless run scripts and the Blender-side measurement modules.",
-  "license": "GPL-3.0-or-later",
-  "author": "Luxuride",
-  "type": "module",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/luxuride-pi-extensions/pi-blender-bridge.git"
-  },
-  "homepage": "https://github.com/luxuride-pi-extensions/pi-blender-bridge#readme",
-  "bugs": {
-    "url": "https://github.com/luxuride-pi-extensions/pi-blender-bridge/issues"
-  },
-  "files": [
-    "blender",
-    "test",
-    "LICENSE",
-    "README.md"
-  ],
-  "keywords": [
-    "blender",
-    "bpy",
-    "gpl",
-    "pi-package"
-  ]
+	"name": "@luxuride-pi/blender-bridge",
+	"version": "0.1.0",
+	"description": "The GPL-3.0 Python half of pi-blender: the live bridge, the headless run scripts and the Blender-side measurement modules.",
+	"license": "GPL-3.0-or-later",
+	"author": "Luxuride",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/luxuride-pi-extensions/pi-blender-bridge.git"
+	},
+	"homepage": "https://github.com/luxuride-pi-extensions/pi-blender-bridge#readme",
+	"bugs": {
+		"url": "https://github.com/luxuride-pi-extensions/pi-blender-bridge/issues"
+	},
+	"files": [
+		"blender",
+		"test",
+		"LICENSE",
+		"README.md",
+		"!**/__pycache__",
+		"!**/*.pyc"
+	],
+	"keywords": [
+		"blender",
+		"bpy",
+		"gpl",
+		"pi-package"
+	]
 }
