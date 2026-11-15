@@ -344,6 +344,42 @@ def main():
         verdict["checks"]["duplicateObjects"]["status"] == "ok"
     )
 
+    # A generative blockout is a starting point, so the profiles that ship a
+    # hand-modelled surface refuse it outright and prop merely says so. The tag
+    # is what the importer writes; nothing here depends on the topology being
+    # bad, because a manifold blockout is still unbuilt.
+    for profile in ("character", "hard_surface", "print"):
+        reset()
+        obj = cube("BlockoutBody")
+        obj["pi_blender_blockout"] = True
+        verdict = validate(bpy, [obj.name], profile=profile)
+        checks[f"a blockout blocks {profile}"] = (
+            verdict["checks"]["blockout"]["status"] == "block"
+            and "blockout" in verdict["blockers"]
+            and verdict["blocking"] is True
+            and "rebuild" in verdict["checks"]["blockout"]["reason"]
+        )
+    for profile in ("prop", "interior", "asset_pack"):
+        reset()
+        obj = cube("BlockoutBody")
+        obj["pi_blender_blockout"] = True
+        verdict = validate(bpy, [obj.name], profile=profile)
+        checks[f"a blockout warns {profile}"] = (
+            verdict["checks"]["blockout"]["status"] == "warn"
+            and "blockout" in verdict["warnings"]
+            and "blockout" not in verdict["blockers"]
+            and verdict["blocking"] is False
+        )
+
+    # Rebuilt geometry must stop tripping the gate, or the check is a dead end:
+    # the tag is the whole signal, so clearing it is what finishes the rebuild.
+    reset()
+    obj = cube("Rebuilt")
+    verdict = validate(bpy, [obj.name], profile="character")
+    checks["an untagged mesh passes the blockout gate"] = (
+        verdict["checks"]["blockout"]["status"] == "ok" and "blockout" not in verdict["blockers"]
+    )
+
     for name, passed in checks.items():
         print(f"{'ok' if passed else 'FAIL'}: {name}")
     if not all(checks.values()):

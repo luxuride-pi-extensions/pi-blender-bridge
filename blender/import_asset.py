@@ -298,3 +298,325 @@ def handle_import(request, open_blend):
         "importedObjects": imported_names,
         "report": report,
     }
+
+
+# --- Generative blockout ingress -------------------------------------------
+#
+# A blockout is a provider's starting point, not a module output: the topology
+# is dense, usually non-manifold and often unwrapped. It is imported into its
+# own collection in its own blend, tagged, and measured, because the one thing
+# that must not happen is a worker treating it as finished geometry.
+
+# The tag is owned by validation, which is what reads it back: one spelling for
+# the writer and the gate, or the gate silently passes what the importer wrote.
+try:
+    from validation import BLOCKOUT_TAG  # noqa: E402
+except ImportError:
+    # Imported as `blender.import_asset` (which is how the probes reach it)
+    # rather than as a sibling module on the bridge's own sys.path.
+    from blender.validation import BLOCKOUT_TAG  # noqa: E402
+
+BLOCKOUT_COLLECTION = "Blockout"
+
+# glTF fixes its unit to metres. Every other format carries whatever the author
+# used, and nothing in the file says which, so the scale is a stated assumption
+# rather than a measurement.
+UNIT_KNOWN_FORMATS = ("gltf", "glb")
+
+# Above this the surface is a scan, not a blockout: retopology at that density is
+# a rewrite, and the manager should see the number before it plans the work.
+DENSE_TRIANGLES = 50000
+
+# A blockout is upright enough when its longest axis is this close to +Z.
+UPRIGHT_TOLERANCE_DEGREES = 10.0
+
+
+def _world_bounds(objects):
+    """The world-space box around the given objects, or None for no geometry.
+
+    Mesh vertices rather than `obj.bound_box`: the box is a depsgraph result, and
+    the normaliser rewrites mesh data between passes, so a cached box would
+    report the size the import arrived at instead of the size it was just made.
+    """
+    low = [math.inf, math.inf, math.inf]
+    high = [-math.inf, -math.inf, -math.inf]
+    for obj in objects:
+        if obj.type == "MESH" and obj.data is not None:
+            points = (vertex.co for vertex in obj.data.vertices)
+        else:
+            points = (Vector(corner) for corner in obj.bound_box)
+        for co in points:
+            point = obj.matrix_world @ co
+            for axis in range(3):
+                low[axis] = min(low[axis], point[axis])
+                high[axis] = max(high[axis], point[axis])
+    if low[0] == math.inf:
+        return None
+    return {
+        "min": [round(float(value), 5) for value in low],
+        "max": [round(float(value), 5) for value in high],
+        "dimensions": [round(float(high[axis] - low[axis]), 5) for axis in range(3)],
+    }
+
+
+def _apply_matrix(objects, matrix):
+    """Bake `matrix` into the mesh data and leave every object transform identity.
+
+    Baking rather than storing an object-level scale is what makes the result
+    usable downstream: a leftover 0.01 object scale is exactly the unappliedScale
+    defect preflight blocks on, and the worker is meant to rebuild from this
+    geometry, not to scale it again.
+    """
+    for obj in objects:
+        world = matrix @ obj.matrix_world
+        # A glTF importer parents the scene's meshes under a root empty; keeping
+        # the parent would re-apply its transform after the bake.
+        obj.parent = None
+        if obj.type != "MESH" or obj.data is None:
+            obj.matrix_world = world
+            continue
+        mesh = obj.data
+        # One mesh datablock can be instanced across several objects, and moving
+        # a shared datablock once per object would move it as many times.
+        if mesh.users > 1:
+            obj.data = mesh.copy()
+            mesh = obj.data
+        mesh.transform(world)
+        obj.matrix_world = Matrix.Identity(4)
+
+
+def _normalise_blockout(objects, target_bounds):
+    """Stand the import upright and fit it inside the requested box.
+
+    A generator answers in its own pose and its own scale: nothing in a GLB
+    promises the model's up axis is +Z, and providers train at whatever size
+    their dataset used. Both are resolved here, so the caller reads one bounds
+    triple that is already in metres, already centred, and already resting on
+    Z=0. Returns the final bounds and the notes worth showing the caller.
+    """
+    _apply_matrix(objects, Matrix.Identity(4))
+    meshes = [obj for obj in objects if obj.type == "MESH" and obj.data is not None]
+    if not meshes:
+        return None, ["the import contains no mesh objects"]
+    notes = []
+
+    reference = max(meshes, key=lambda obj: len(obj.data.vertices))
+    axes = compute_principal_axes(reference)
+    if not axes.get("available"):
+        notes.append(
+            f"orientation was not normalised: {axes.get('reason') or 'no principal axis'}"
+        )
+    else:
+        primary = Vector(axes["primaryAxis"])
+        if primary.length > 1e-6:
+            # A model lying upside down is a flip rather than a tilt, so pick the
+            # end of the axis that points up before measuring the angle.
+            if primary.z < 0:
+                primary = -primary
+            angle = primary.angle(Vector((0.0, 0.0, 1.0)))
+            if angle > math.radians(UPRIGHT_TOLERANCE_DEGREES):
+                box = _world_bounds(objects)
+                centre = Vector([(box["min"][axis] + box["max"][axis]) / 2.0 for axis in range(3)])
+                rotation = primary.rotation_difference(Vector((0.0, 0.0, 1.0))).to_matrix().to_4x4()
+                _apply_matrix(
+                    objects,
+                    Matrix.Translation(centre) @ rotation @ Matrix.Translation(-centre),
+                )
+                notes.append(f"rotated {math.degrees(angle):.1f} degrees so the longest axis is +Z")
+
+    box = _world_bounds(objects)
+    if target_bounds:
+        factors = [
+            target_bounds[axis] / box["dimensions"][axis]
+            for axis in range(3)
+            if target_bounds[axis] > 0 and box["dimensions"][axis] > 1e-9
+        ]
+        # The smallest factor is the one that binds: the model fits inside the
+        # box on every axis rather than filling it on one and overflowing the
+        # others, because a blockout that overflows is exactly the export the
+        # bounds check rejects later.
+        factor = min(factors) if factors else 1.0
+        if abs(factor - 1.0) > 1e-6:
+            _apply_matrix(objects, Matrix.Scale(factor, 4))
+            notes.append(f"scaled by {factor:.4f} to fit the target bounds")
+        box = _world_bounds(objects)
+
+    offset = Vector((
+        -(box["min"][0] + box["max"][0]) / 2.0,
+        -(box["min"][1] + box["max"][1]) / 2.0,
+        -box["min"][2],
+    ))
+    _apply_matrix(objects, Matrix.Translation(offset))
+    return _world_bounds(objects), notes
+
+
+def _triangle_count(meshes):
+    total = 0
+    for obj in meshes:
+        if obj.type != "MESH" or obj.data is None:
+            continue
+        obj.data.calc_loop_triangles()
+        total += len(obj.data.loop_triangles)
+    return total
+
+
+def _missing_uv(meshes):
+    missing = []
+    for obj in meshes:
+        if obj.type != "MESH" or obj.data is None:
+            continue
+        layers = getattr(obj.data, "uv_layers", None)
+        if not layers or len(layers) == 0:
+            missing.append(obj.name)
+    return sorted(missing)
+
+
+def _blockout_collection():
+    """The one collection a blockout lives in, created on first use.
+
+    Separate from the module's own collection because the module's collection is
+    what `branch_apply` merges into model.blend. A blockout in it would be a
+    blockout in the shipped mesh.
+    """
+    collection = bpy.data.collections.get(BLOCKOUT_COLLECTION)
+    if collection is None:
+        collection = bpy.data.collections.new(BLOCKOUT_COLLECTION)
+    if collection.name not in {child.name for child in bpy.context.scene.collection.children}:
+        bpy.context.scene.collection.children.link(collection)
+    return collection
+
+
+def _target_bounds(raw):
+    """The requested fit box in metres, or (None, None) when unrestricted."""
+    if raw is None:
+        return None, None
+    values = [raw.get(key) for key in ("x", "y", "z")] if isinstance(raw, dict) else list(raw)
+    if len(values) != 3:
+        return None, "targetBounds must be { x, y, z } in metres."
+    try:
+        numbers = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None, "targetBounds must be { x, y, z } in metres."
+    if any(number <= 0 for number in numbers):
+        return None, "targetBounds must be positive metres on every axis."
+    return numbers, None
+
+
+def handle_blockout_import(request, open_blend=None):
+    """Import a generated blockout into its own blend, tagged and measured.
+
+    Returns the provenance the caller writes into the reference manifest and the
+    warnings a worker needs before it plans a rebuild. Nothing is merged into
+    model.blend: the caller decides what to rebuild from this, which is the whole
+    difference between a blockout and an asset.
+    """
+    if open_blend is not None:
+        open_blend(request)
+
+    source_path = request.get("sourcePath")
+    if not source_path or not os.path.exists(source_path):
+        return {
+            "success": False,
+            "status": "file_not_found",
+            "error": f"Blockout source does not exist: {source_path}",
+        }
+
+    fmt = str(request.get("format") or os.path.splitext(source_path)[1].lstrip(".")).lower()
+    if fmt not in ("glb", "gltf", "obj"):
+        return {
+            "success": False,
+            "status": "unsupported_format",
+            "format": fmt,
+            "error": f'Blockout import accepts glb, gltf or obj; got "{fmt}".',
+        }
+
+    supported, status, error = _probe_format_and_addon(fmt)
+    if not supported:
+        return {"success": False, "status": status, "format": fmt, "error": error}
+
+    target_bounds, bounds_error = _target_bounds(request.get("targetBounds"))
+    if bounds_error:
+        return {"success": False, "status": "invalid_target_bounds", "format": fmt, "error": bounds_error}
+
+    existing_names = set(bpy.data.objects.keys())
+    try:
+        _run_import(fmt, source_path)
+    except Exception as failure:
+        return {
+            "success": False,
+            "status": "import_failed",
+            "format": fmt,
+            "error": f"Blender {fmt} import failed: {failure}",
+        }
+
+    imported = [obj for name, obj in bpy.data.objects.items() if name not in existing_names]
+    if not imported:
+        imported = list(bpy.context.selected_objects)
+    if not imported:
+        return {
+            "success": False,
+            "status": "empty_import",
+            "format": fmt,
+            "error": "The source imported no objects.",
+        }
+
+    collection = _blockout_collection()
+    for obj in imported:
+        for other in list(obj.users_collection):
+            other.objects.unlink(obj)
+        collection.objects.link(obj)
+        obj[BLOCKOUT_TAG] = True
+
+    bounds, notes = _normalise_blockout(imported, target_bounds)
+    triangles = _triangle_count(imported)
+
+    warnings = []
+    if fmt not in UNIT_KNOWN_FORMATS:
+        warnings.append(
+            f"{fmt} states no unit: the source scale was read as metres, so correct it if it was authored in anything else"
+        )
+    if triangles > DENSE_TRIANGLES:
+        warnings.append(
+            f"{triangles} triangles is scan-grade, not blockout-grade: decimate or retopologise before comparing it to a render"
+        )
+    missing_uv = _missing_uv(imported)
+    if missing_uv:
+        warnings.append(
+            f"no UV map on {', '.join(missing_uv)}: the blockout cannot be painted until it is unwrapped"
+        )
+
+    blend_path = request.get("blendPath")
+    if blend_path:
+        blend_path = os.path.abspath(blend_path)
+        directory = os.path.dirname(blend_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+    else:
+        bpy.ops.wm.save_mainfile()
+
+    provider = str(request.get("provider") or "local")
+    raw_name = request.get("name") or os.path.splitext(os.path.basename(source_path))[0]
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", str(raw_name)).strip("-").lower() or "blockout"
+    return {
+        "success": True,
+        "status": "imported",
+        "format": fmt,
+        "sourcePath": os.path.abspath(source_path),
+        "blendPath": bpy.data.filepath or None,
+        "collection": collection.name,
+        "objects": [obj.name for obj in imported],
+        "notes": notes,
+        "provenance": {
+            "id": request.get("id") or f"{provider}-{slug}",
+            "path": os.path.abspath(source_path),
+            "provider": provider,
+            "license": request.get("license") or "unknown",
+            "prompt": request.get("prompt"),
+            "seed": request.get("seed"),
+            "bounds": bounds,
+            "triangles": triangles,
+            "blockout": True,
+        },
+        "warnings": warnings,
+    }
